@@ -1,0 +1,249 @@
+		     +--------------------------+
+       	     |         CSL373           |
+		     | PROJECT 2: USER PROGRAMS	|
+		     | 	   DESIGN DOCUMENT     	|
+		     +--------------------------+
+
+---- GROUP ----
+
+
+
+---- PRELIMINARIES ----
+
+All tests are passing. This probably was the most difficult part too.
+Creating a program is easy but making it stable and robust takes time and 
+the tests covered most corners of the system calls.
+
+I referred to XV6 code for a couple of things like how the system call result
+is returned to the user and how to make sure that parent go to sleep if it
+calls wait and child is running.
+
+			   ARGUMENT PASSING
+			   ================
+
+---- DATA STRUCTURES ----
+
+A list of pointers is used to store the tokens in a string. Other than this
+no new data structure is used to processes argument passing.
+
+Function strtok_r is used to get the tokens.
+
+---- ALGORITHMS ----
+
+1. 	I use strtok_r to get all the pointers to the tokens in the string
+	and number of tokens (argc).
+2. 	In reverse order, I copy the tokens onto stack also remembering the
+	address in stack.
+3. 	Fix alignment
+4. 	Push 0
+5. 	I now push the addresses of Step2: in stack.
+6. 	Push argc
+7. 	Push 0
+
+I also make sure that the string passed in exec is way below the size
+of a page. So that It doesn't overflow the stack page.
+
+---- RATIONALE ----
+
+>> A3: Why does Pintos implement strtok_r() but not strtok()?
+
+*	A thread can be preempted when it this function and multiple threads 
+	can call this function simultaneously. That can cause race conditions
+	while accessing global variables. 
+
+>> A4: In Pintos, the kernel separates commands into a executable name
+>> and arguments.  In Unix-like systems, the shell does this
+>> separation.  Identify at least two advantages of the Unix approach.
+
+*	Shell usually has to check the permissions and existence of the
+	program file. So shell has to tokenize the program name. It makes
+	sense not to parse out the program name again in kernel.
+*	It puts less processing on kernel side.
+
+			     SYSTEM CALLS
+			     ============
+
+---- DATA STRUCTURES ----
+
+>> B1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+struct thread: (member additions)
+	struct file* fd_table[FDTABLESIZE];		File descriptor table
+	struct file* fi;						file pointer of the executable being run by current thread
+	uint32_t exit_status;					Exit status returned by program
+	tid_t parent_tid; 						TID of parent of this thread
+	struct thread* parent_waiting;			ptr to waiting parent thread, to be unblocked on exit 
+
+Struct for a zombie thread. Has tid, parent_tid and exit_status. 
+all_zombie_elem is for creating list of zombie_thread.
+	struct zombie_thread
+	{
+	  struct list_elem all_zombie_elem;
+	  tid_t tid;
+	  tid_t parent_tid;
+	  uint32_t exit_status;
+	};
+
+static struct list all_zombie;		// list of all zombie_threads
+
+struct lock filesys_lock;		// global lock for mutually exclusive access to file system.
+
+
+>> B2: Describe how file descriptors are associated with open files.
+>> Are file descriptors unique within the entire OS or just within a
+>> single process?
+	I have a per thread static array of file pointers. The index is the file
+	descriptor and element is file*.
+
+	The file descriptors are unique for a thread.
+
+---- ALGORITHMS ----
+
+>> B3: Describe your code for reading and writing user data from the
+>> kernel.
+
+	First, I make sure that stack address is correct. Then I get the
+	arguments off the stack.
+	The arguments may be plane data, pointers, buffer or strings.
+		* For pointer we need to check one address.
+		* buffer and string require address check for a range.
+		* In case range I first check the first address then first 
+		address of next page untill the given range is complete.
+	
+	Following are the checks I make before calling the actual calls:
+		* The address is < PHYS_BASE
+		* The address is != NULL
+		* The address is mapped in the page_dir.
+
+>> B4: Suppose a system call causes a full page (4,096 bytes) of data
+>> to be copied from user space into the kernel.  What is the least
+>> and the greatest possible number of inspections of the page table
+>> (e.g. calls to pagedir_get_page()) that might result?  What about
+>> for a system call that only copies 2 bytes of data?  Is there room
+>> for improvement in these numbers, and how much?
+	* [4096] 	least - 1 and greatest - 2
+	* [2]		same
+	* no room for improvement.
+	
+>> B5: Briefly describe your implementation of the "wait" system call
+>> and how it interacts with process termination.
+	In an infinite loop:
+	* If the caller is not valid parent return -1
+	* I scan through zombie_thread list, return the exit_status if zombie found
+	* If the child is found but running then I set parent_waiting 
+	and call thread_block.
+	
+	When the child terminates it checks if there is a parent_waiting. If
+	found then unblock it.
+	
+>> B6: Any access to user program memory at a user-specified address
+>> can fail due to a bad pointer value.  Such accesses must cause the
+>> process to be terminated.  System calls are fraught with such
+>> accesses, e.g. a "write" system call requires reading the system
+>> call number from the user stack, then each of the call's three
+>> arguments, then an arbitrary amount of user memory, and any of
+>> these can fail at any point.  This poses a design and
+>> error-handling problem: how do you best avoid obscuring the primary
+>> function of code in a morass of error-handling?  Furthermore, when
+>> an error is detected, how do you ensure that all temporarily
+>> allocated resources (locks, buffers, etc.) are freed?  In a few
+>> paragraphs, describe the strategy or strategies you adopted for
+>> managing these issues.  Give an example.
+	I test all the addresses as described in the answer of B3.
+	e.g. in file open: I have to check the string passed. I call the function
+	user_string_add_range_check_and_terminate(char* str)
+	It checks the validity and terminates if found invalid.
+	
+	When I find that an addresse is invalid. I set the exit_status to -1
+	and call process_terminate(). Which ultimately calls process_exit().
+	And in process_exit() I clean up everything. Close all files of fdtable, 
+	free pagedir, close executable file etc.
+
+---- SYNCHRONIZATION ----
+
+>> B7: The "exec" system call returns -1 if loading the new executable
+>> fails, so it cannot return before the new executable has completed
+>> loading.  How does your code ensure this?  How is the load
+>> success/failure status passed back to the thread that calls "exec"?
+	
+	I make sure there is memory available in user space equal to the 
+	executable filesize before thread_create. So that pintos may be
+	able to load the program when the thread gets to run for the first
+	time. 
+	
+	The calling thread will get the return value of exec status as -1 if 
+	the required memory is not available.
+
+>> B8: Consider parent process P with child process C.  How do you
+>> ensure proper synchronization and avoid race conditions when P
+>> calls wait(C) before C exits?  After C exits?  How do you ensure
+>> that all resources are freed in each case?  How about when P
+>> terminates without waiting, before C exits?  After C exits?  Are
+>> there any special cases?
+	
+	P calls wait(C) before C exits:
+		P calls thread_block() expecting the child to wake him up on 
+		child's exit.
+	P calls wait(C) after C exits:
+		P will immediately get the exit_status
+
+	P terminates without waiting (before C exits):
+		This will result in zombies with dead parent. These will get 
+		cleaned up by the following function which is called frequently:
+			zombie_with_dead_parent_cleanup()
+	
+	P terminates without waiting (after C exits):
+		This will get cleaned up when the parent is terminating by the
+		function.
+			zombie_cleanup_on_parent_termination(parent_tid)	
+	
+---- RATIONALE ----
+
+>> B9: Why did you choose to implement access to user memory from the
+>> kernel in the way that you did?
+	
+	I choose to walk the pagedir instead of making MMU do the same.
+	This results in simple implementation and doesn't face problems 
+	of freeing up resources etc at page fault.
+
+
+>> B10: What advantages or disadvantages can you see to your design
+>> for file descriptors?
+	
+	Advantage is that the implementation is simple. Dup implementation 
+	will also be simple with this.
+	Disadvantages: 
+		* Number of files is fixed.
+		* Different process will require differnt number of FDs.
+		
+>> B11: The default tid_t to pid_t mapping is the identity mapping.
+>> If you changed it, what advantages are there to your approach?
+	
+	If we want multiple kernel threads per process then my approch
+	will fail.
+
+			   SURVEY QUESTIONS
+			   ================
+
+Answering these questions is optional, but it will help us improve the
+course in future quarters.  Feel free to tell us anything you
+want--these questions are just to spur your thoughts.  You may also
+choose to respond anonymously in the course evaluations at the end of
+the quarter.
+
+>> In your opinion, was this assignment, or any one of the three problems
+>> in it, too easy or too hard?  Did it take too long or too little time?
+
+>> Did you find that working on a particular part of the assignment gave
+>> you greater insight into some aspect of OS design?
+
+>> Is there some particular fact or hint we should give students in
+>> future quarters to help them solve the problems?  Conversely, did you
+>> find any of our guidance to be misleading?
+
+>> Do you have any suggestions for the TAs to more effectively assist
+>> students, either for future quarters or the remaining projects?
+
+>> Any other comments?

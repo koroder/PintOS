@@ -1,0 +1,417 @@
+       	    +---------------------------+
+		    |	        	CSL373		|
+		    | PROJECT 3: VIRTUAL MEMORY	|
+		    |	       DESIGN DOCUMENT	|
+		    +---------------------------+
+
+---- GROUP ----
+
+>> Fill in the names and email addresses of your group members.
+
+Abdul Hadi Shakir <cs1100202@cse.iitd.ernet.in>
+Bharat Ratan      <cs5100280@cse.iitd.ernet.in>
+
+---- PRELIMINARIES ----
+
+>> If you have any preliminary comments on your submission, notes for the
+>> TAs, or extra credit, please give them here.
+
+>> Please cite any offline or online sources you consulted while
+>> preparing your submission, other than the Pintos documentation, course
+>> text, lecture notes, and course staff.
+
+			PAGE TABLE MANAGEMENT
+			=====================
+
+---- DATA STRUCTURES ----
+
+>> A1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+// defines where the page is located currently
+struct placed
+{
+	bool ex;		// executable
+	bool mmap;		// memory mapped
+	bool swap;		// swap
+	bool loaded;	// loaded from the file
+};
+
+
+// shadow entry corresponding to the page
+// together they will constitute the shadow page table
+struct shadow_elem
+{
+	void *uvaddr;		// user virtual address
+	struct placed where;// current location of page
+	bool writable;		// whether the page is writable
+	
+	//variables used for executables
+	struct file *f_ex;
+	off_t ofs_ex;
+	uint32_t read_bytes_ex;
+	uint32_t zero_bytes_ex;
+	
+	//variables for mmaped files
+	struct file *f_mm;
+	off_t ofs_mm;
+	uint32_t read_bytes_mm;
+
+	//variables for swapping space
+	block_sector_t sec_no;	//sector number of the swap slot
+				//applicable only if page is in swap
+	
+	struct hash_elem elem;  // will constitute the hash table
+};
+
+struct thread
+{
+	......
+	......
+	struct hash shadow_pg_tbl;     // shadow page table
+	struct hash map_table;         // mapid table
+    int  mapid_unique;             // per thread variable for memory mapped files.
+	......
+	......
+};
+
+struct lock ftable_lock;	// lock for the frame table
+
+---- ALGORITHMS ----
+
+>> A2: In a few paragraphs, describe your code for locating the frame,
+>> if any, that contains the data of a given page.
+
+We are maintaining two distinct data structures - i). FRAME TABLE and 
+ii). SHADOW (SUPPLEMENTARY) PAGE TABLE. The frame table maintains the list of
+frames - their kernel address and user virtual address, and processes tid.
+Whereas, the supplementary page table maintains information whether the page
+(that has not yet been loaded) is located where - in executable, memory
+mapped files or the swap space. The frame table (global data structure) is list,
+whereas the supplementary page table (per-process data structure) is a hash-table
+hashed by user VA. 
+
+Since, the loading of page is done lazily - a page fault will occur when the
+the page is first tried to accessed. Upon the pagefault, the process looks upon
+the suppl. page table table entry corresponding to the faulting address.
+The page table entry contains the information whether page has to be loaded
+from executable, or memory mapped files or the swap space or it is a VALID
+stack access (the 'where' structure of supplementary page table).
+In the latter, case the stack is grown by asking for a page from the frame
+allocator. If the faulting address page table entry fails to meet any of these
+conditons then it is a valid page fault, and hence the process is terminated.
+
+Whenever the frame is allocated, a frame table entry is created corresponding
+to this and the frame table is updated. The user virtual address is also inserted
+in the frame table entry. Then the page is INSTALLED in the page-directory
+corresponding to the process.
+
+>> A3: How does your code coordinate accessed and dirty bits between
+>> kernel and user virtual addresses that alias a single frame, or
+>> alternatively how do you avoid the issue?
+
+In our code we have accessed pages only using the user VA, except for the
+case when swapping is done. Swapping takes the kernel VA. Therefore, while
+checking whether the frame is dirty we call 'pagedir_is_dirty()' function
+with both kernel and user VA (aliasing). Thus even if it turns out to be 
+true by any of the two - the frame is dirty. Similarly for the determining
+the access bits we use the 'pagedir_is_accessed()' function in a similar 
+faishon.
+
+
+---- SYNCHRONIZATION ----
+
+>> A4: When two user processes both need a new frame at the same time,
+>> how are races avoided?
+
+To ensure that such a race condition does not occur we have defined a lock
+called 'ftable_lock'. A process has to first acquire the ftable_lock in
+order to operate on the gloabl frame table. Once it is done with it, the frame
+table lock is released. Thus using this lock ensures that only one process
+can operate with frame table at a time and mutual exclusion between
+processed are ensured.
+
+---- RATIONALE ----
+
+>> A5: Why did you choose the data structure(s) that you did for
+>> representing virtual-to-physical mappings?
+
+We have used list data-structure for the frame table. This ensures
+that excessive memory is not used. There is tradeoff between searching
+and memory. We have choosed to go with memory because searching in
+frame table will not take a lot of time because the number of user pages
+is limited to around 400.
+
+We have used hash-table for the shadow page table. The 'hash-table'
+data-structure ensures that searching and accessing is done in O(1)
+time. We have used user VA to hash into the hash-table. Since the
+user VA is unique in itself the probability of collision is minimised.
+In case of a collision, the colliding element are stored in a list.
+
+		       PAGING TO AND FROM DISK
+		       =======================
+
+---- DATA STRUCTURES ----
+
+>> B1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+// defining structure for an element of frame table
+struct frame
+{
+	void *phy_frame;	    // stores return value of palloc_get_page()
+	void *uvaddr;	        // user virtual address corresponding to the physical frame
+	tid_t tid;              // tid of the process which is allowed to use this physical frame
+
+	struct list_elem elem;	// this will constitute the element of list
+};
+
+struct list ftable_list;	// global list of frame table
+
+---- ALGORITHMS ----
+
+>> B2: When a frame is required but none is free, some frame must be
+>> evicted.  Describe your code for choosing a frame to evict.
+
+We have used the 'clock algorithm' for implementing our eviction strategy.
+
+There is a global clock pointer same across all processes. The entry 
+(page/frame) corresponding to the clock pointer is checked for its accessed
+bits. If the access bit is 1 it is set to 0, and the clock pointer is
+shifted by to next element. If the access bit is 0, that page (frame)
+is choosen to be the viable candidate for eviction. The clock pointer
+is moved to the next entry.
+
+If the clock pointer reaches the tail of frame table list, it is again 
+pointed to the the head of the list. This is the very property of clock.
+The clock pointer head is initially pointed to the first frame.
+
+The clock replacement algorithm approximates to LRU and takes the 
+advantage of FIFO as well. 
+
+>> B3: When a process P obtains a frame that was previously used by a
+>> process Q, how do you adjust the page table (and any other data
+>> structures) to reflect the frame Q no longer has?
+
+When a process P obtains a frame that was previously used by process Q,
+then process P ensures that invariant remains the same for !. It does 
+so by first destroying the page-directory entry corresponding to the
+process Q. Then it updates the shadow page table entry of that process
+corresponding to the the address of the frame.
+
+Thus next time process Q tries to access that address, a page-fault
+will occur and Q can then according load the page (from swap) by 
+obtaining information from the shadow page table entry. 
+
+>> B4: Explain your heuristic for deciding whether a page fault for an
+>> invalid virtual address should cause the stack to be extended into
+>> the page that faulted.
+
+Our heuristic for deciding whether the stack should be extended checks
+for two things:
+1. esp is within 32 bytes of faulting address 
+i.e. ( addr >= (esp - 32) ).
+
+2. The stack size does not exceed the STACK_SIZE_MAX (defined to be 8 MB).
+i.e. ( PHYS_BASE - pg_round_down (addr)) <= STACK_SIZE_MAX )
+
+---- SYNCHRONIZATION ----
+
+>> B5: Explain the basics of your VM synchronization design.  In
+>> particular, explain how it prevents deadlock.  (Refer to the
+>> textbook for an explanation of the necessary conditions for
+>> deadlock.)
+
+-- We have a frame table, a swap table and shadow page tables to 
+   manage the virtual memory for each process. Frame table and swap 
+   table are global and shadow page table is per-process. So both the 
+   frame table and swap table are provided separate locks which avoids 
+   the race conditions in using and these data structures. Whenever we 
+   have to update these we try to acquire corresponding locks. Now 
+   the shadow page table of one process can also be update by another 
+   process at the time of eviction. This is protected by disabling the
+   interrupts while updating the shadow page table entry at eviction.
+   Since the dead lock occurs when one process tries to acquire two locks 
+   and another process also tries the same locks in opposite order. So to 
+   prevent the dead locks we ensured that the same process does not acquire
+   two locks at a time.
+
+>> B6: A page fault in process P can cause another process Q's frame
+>> to be evicted.  How do you ensure that Q cannot access or modify
+>> the page during the eviction process?  How do you avoid a race
+>> between P evicting Q's frame and Q faulting the page back in?
+
+When a process P causes Q's frame to be evicted, the entire process of
+eviction is done with interrupts disabled. Disabling the interrupts means
+no other process (Q) can be scheduled untill process P has finished 
+the entire process of eviction. Thus whilst P is evicting frame, the
+process Q cannot run and hence cannot modify the the page that is being
+evicted.
+
+Disabling interrupts during eviction also ensures that Q cannot fault the
+page back into the memory. Disabling interrupt means process Q cannot be 
+scheduled again, and hence cannot fault in the page. 
+
+>> B7: Suppose a page fault in process P causes a page to be read from
+>> the file system or swap.  How do you ensure that a second process Q
+>> cannot interfere by e.g. attempting to evict the frame while it is
+>> still being read in?
+
+The first thing to note is that PINTOS is uniprocessor OS. Only one 
+process can run at a time. Suppose a process P is modifying a frame,
+when it is descheduled and process Q is scheduled. Process Q evicts 
+the frame, thus destroying the page-directory entry corresponding to
+that frame in P's page-directory. Q will also move that frame into the 
+swap space. Next time, when P is scheduled again it will try to access
+that frame which will result in page-fault. The process P can then obtain
+that frame from the swap space. Thus interference is taken proper care of.
+
+>> B8: Explain how you handle access to paged-out pages that occur
+>> during system calls.  Do you use page faults to bring in pages (as
+>> in user programs), or do you have a mechanism for "locking" frames
+>> into physical memory, or do you use some other design?  How do you
+>> gracefully handle attempted accesses to invalid virtual addresses?
+
+Before getting into the real functionality of the system call, the pages 
+checked in advance. If it is paged out to the swap space, it is brought
+back in from swap space. Then the entry corresponding to that in the shadow
+page table is updated with the '->swap' field set to false. 
+
+Before reading in paged-out page, the address is checked out whether it is
+valid address or a valid stack access. If these check fails, pages corresponding
+to faulting address will not be read and the process invoking the system
+call will be forced to terminate with an error termination status.
+
+
+---- RATIONALE ----
+
+>> B9: A single lock for the whole VM system would make
+>> synchronization easy, but limit parallelism.  On the other hand,
+>> using many locks complicates synchronization and raises the
+>> possibility for deadlock but allows for high parallelism.  Explain
+>> where your design falls along this continuum and why you chose to
+>> design it this way.
+
+-- Using a single lock for the whole VM is really a bad design because it 
+   limits the parallelism. To remove this restiction we used a separate lock 
+   for each data structure. For example to protect frame table we used 
+   ftable lock, to protect swap table we used swap table lock and to protect
+   file system we used filesys lock. We also tried to acquire the synchronisation
+   by enabling and desabling the interrupt to protect the shadow page tables .
+   In order to achieve higher parallelism we tried to decrease the size of
+   critical section as short as possible. To avoid the dead locks we ensured that
+   a same prosess do not acquire two locks at time, if it is difficult to avoid 
+   then each process must acquire them in same order
+
+			 MEMORY MAPPED FILES
+			 ===================
+
+---- DATA STRUCTURES ----
+
+>> C1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+  ( thread.h  line number-133 struct thread)
+--1.   int  mapid_unique;                  // per thread variable for memory mapped files.
+--     Per thread varible which is the returned from mmap system call and increased by 1.
+
+  ( thread.c  line number-499)
+--2.   t->mapid_unique = 0; 
+       initializing the variable to 0.
+       
+  ( thread.h  line number-132 struct thread)
+--3.   struct hash map_table;              // mapid table
+       A hash table which contains some database for each memory mapped file, which can be
+       used during unmap.
+       
+  ( page.h    line number-51 )
+--4.   // structure for hash table of mapids-> filename
+       struct map_elem
+       {
+           int mapid;				// unique mapid
+           void *uvaddr;			// user VA
+           int size;				// represents size to be mapped
+           struct file *file;		        // file ptr
+           struct hash_elem elem; 		// will constitute the hash table
+       };
+       An element of the hash table.
+       
+---- ALGORITHMS ----
+
+>> C2: Describe how memory mapped files integrate into your virtual
+>> memory subsystem.  Explain how the page fault and eviction
+>> processes differ between swap pages and other pages.
+
+-- In order to integrate the memory mapped file into VM and to differntiate
+   among the virtual pages, weather it is an exacutable or memory mapped or 
+   stack page, We are maintaining a "struct placed" in the shadow page table
+   corresponding to each virtual page. Whenever we have to catagories a page 
+   as memory mapped we set the variable mmap of the struct placed true.
+   
+-- Again we are maintaining a variable swap in the struct placed, which we 
+   set to 1 whenever we have to send something to the swap during eviction. 
+   When a page fault occurs due to page which is in swap we just have to check
+   the varible swap and if it is true, we call load_from_swap() function which 
+   brings the page into physical memory and sets the swap to 0.  
+   In case of memory mapped files we don't need to use swap variable as we write
+   dirty pages back to the file itself during eviction and load them back from 
+   file during page fault. A separate variable loaded is maintained in struct 
+   placed for this purpose.
+
+>> C3: Explain how you determine whether a new file mapping overlaps
+>> any existing segment.
+
+-- During the mmap system call, as per lazy loading procedure we create 
+   only shadow page table for each page of the memory mapped file.
+   If some mapping is already there then the shadow page table corresponding 
+   to that entry shouldn't be null. So we are just checking the shadow page 
+   table entry for each page and if anyone is non null then there is overlapping.
+
+---- RATIONALE ----
+
+>> C4: Mappings created with "mmap" have similar semantics to those of
+>> data demand-paged from executables, except that "mmap" mappings are
+>> written back to their original files, not to swap.  This implies
+>> that much of their implementation can be shared.  Explain why your
+>> implementation either does or does not share much of the code for
+>> the two situations.
+
+-- After realising this fact we allowed our design to share most of the code 
+   for mmaped file and executables. First of all shadow page table entries for 
+   mmaped file and executables differ only by one mode variable. Now whenever 
+   a page fault occurs for demand paging the page fault handler calls demand 
+   page function for both mmap files and executables in the same way disregarding 
+   the mode of the shadow page table entry. After that demand page function 
+   checks the mode and depending upon that it calls one of the load_frm_exec()
+   or load_frm_mmap() function. At the time of eviction also the implementation
+   differs only when we have write the page back to the swap or file itself.
+   If the mode is mmap the page is written back to file and if mode is executable
+   page is written to the swap.
+
+
+			   SURVEY QUESTIONS
+			   ================
+
+Answering these questions is optional, but it will help us improve the
+course in future quarters.  Feel free to tell us anything you
+want--these questions are just to spur your thoughts.  You may also
+choose to respond anonymously in the course evaluations at the end of
+the quarter.
+
+>> In your opinion, was this assignment, or any one of the three problems
+>> in it, too easy or too hard?  Did it take too long or too little time?
+
+>> Did you find that working on a particular part of the assignment gave
+>> you greater insight into some aspect of OS design?
+
+>> Is there some particular fact or hint we should give students in
+>> future quarters to help them solve the problems?  Conversely, did you
+>> find any of our guidance to be misleading?
+
+>> Do you have any suggestions for the TAs to more effectively assist
+>> students, either for future quarters or the remaining projects?
+
+>> Any other comments?
